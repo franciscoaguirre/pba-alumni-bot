@@ -4,12 +4,14 @@ use anyhow::Context as _;
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
-use serenity::builder::{CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage};
+use serenity::builder::{CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage};
+use serenity::all::CommandOptionType;
 use serenity::prelude::*;
 use serenity::model::id::{GuildId, RoleId};
 use serenity::model::application::Interaction;
 use shuttle_secrets::SecretStore;
 use tracing::{error, info};
+use poise::serenity_prelude::Member;
 
 #[subxt::subxt(runtime_metadata_path = "kusama-asset-hub-metadata.scale")]
 pub mod kusama_asset_hub {}
@@ -17,81 +19,56 @@ pub mod kusama_asset_hub {}
 const GRADUATE_ROLE_ID: u64 = 1202266615509418074;
 const CERTIFICATES_COLLECTION: u32 = 15;
 
-struct Bot {
-    guild_id: String,
+struct Data {
     api: OnlineClient<PolkadotConfig>,
 }
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Context<'a> = poise::Context<'a, Data, Error>;
 
-#[async_trait]
-impl EventHandler for Bot {
-    async fn message(&self, ctx: Context, msg: Message) {
-        if msg.content == "!hello" {
-            if let Err(e) = msg.channel_id.say(&ctx.http, "world!").await {
-                error!("Error sending message: {:?}", e);
-            }
-        }
-    }
+#[poise::command(slash_command)]
+async fn hello(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.say("world!").await?;
+    Ok(())
+}
 
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("{} is connected!", ready.user.name);
-
-        let guild_id = GuildId::new(self.guild_id.parse().expect("Couldn't parse guild id as a number"));
-
-        let _ = guild_id.set_commands(&ctx.http, vec![
-            CreateCommand::new("hello").description("Say hello"),
-            CreateCommand::new("checknft").description("Check your NFT certificate"),
-        ]).await;
-    }
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            info!("Received command interaction: {command:#?}");
-
-            let command_name = command.data.name.as_str();
-            let member = command.member.as_ref().expect("Couldn't get member");
-
-            let response_content = match command_name {
-                "hello" => "hello".to_owned(),
-                "checknft" => {
-                    let hex_string = "3283cc9f4408df3ccaef653fc163e56509619c1e0e46bb4e677d227fa50bef7f";
-                    let mut bytes = [0u8; 32];
-                    hex::decode_to_slice(hex_string, &mut bytes).expect("Couldn't decode hex string");
-                    let storage_query = kusama_asset_hub::storage().uniques().account(PublicKey(bytes).to_account_id(), CERTIFICATES_COLLECTION, 22);
-                    let result = self.api
-                        .storage()
-                        .at_latest()
-                        .await
-                        .expect("Couldn't get storage at latest block") // TODO: Use `?`
-                        .fetch(&storage_query)
-                        .await
-                        .expect("Couldn't fetch storage query");
-                    if result.is_some() {
-                        member.add_role(&ctx.http, RoleId::new(GRADUATE_ROLE_ID)).await.expect("Couldn't add role to member");
-                        "Certificate found! Added role".to_owned()
-                    } else {
-                        "Certificate not found! Not adding role".to_owned()
-                    }
-                },
-                command => unreachable!("Unknown command {command}"),
-            };
-
-            if let Err(why) = command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new().content(response_content),
-                    ),
-                )
-                .await
-            {
-                error!("Cannot respond to slash command: {why}");
-            }
-        }
+#[poise::command(slash_command)]
+async fn checkcertificate(ctx: Context<'_>, #[description = "Polkadot address public key (hex)"] address: String) -> Result<(), Error> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(address, &mut bytes).map_err(|_| "Invalid address")?;
+    let storage_query = kusama_asset_hub::storage().uniques().account(PublicKey(bytes).to_account_id(), CERTIFICATES_COLLECTION, 22);
+    let result = ctx.data().api
+        .storage()
+        .at_latest()
+        .await
+        .map_err(|error| {
+            error!("Couldn't get storage at latest block: {error:?}");
+            "Internal error"
+        })?
+        .fetch(&storage_query)
+        .await
+        .map_err(|error| {
+            error!("Couldn't fetch storage query: {error:?}");
+            "Internal error"
+        })?;
+    if result.is_some() {
+        let member = ctx.author_member().await.ok_or_else(|| {
+            error!("Couldn't get member");
+            "Internal error"
+        })?;
+        member.add_role(&ctx.http(), RoleId::new(GRADUATE_ROLE_ID)).await.map_err(|error| {
+            error!("Couldn't add role to member: {error:?}");
+            "Internal error"
+        })?;
+        ctx.say("Certificate found! Added role").await?;
+        Ok(())
+    } else {
+        ctx.say("Certificate not found. Not adding role").await?;
+        Ok(())
     }
 }
 
 #[shuttle_runtime::main]
-async fn serenity(
+async fn main(
     #[shuttle_secrets::Secrets] secret_store: SecretStore,
 ) -> shuttle_serenity::ShuttleSerenity {
     // Get secrets
@@ -106,14 +83,26 @@ async fn serenity(
         .await
         .expect("Couldn't connect to RPC node"); // TODO: Use `?`
 
-    let bot = Bot {
-        guild_id,
-        api,
-    };
+    // Setup `poise` framework
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: vec![hello(), checkcertificate()],
+            ..Default::default()
+        })
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(Data {
+                    api,
+                })
+            })
+        })
+        .build();
+
     let client = Client::builder(&token, intents)
-        .event_handler(bot)
+        .framework(framework)
         .await
-        .expect("Err creating client");
+        .map_err(shuttle_runtime::CustomError::new)?;
 
     Ok(client.into())
 }
